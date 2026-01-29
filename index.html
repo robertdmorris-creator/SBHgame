@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D City Racer</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <style>
+        body { margin: 0; overflow: hidden; background: #1a1a2e; touch-action: none; }
+        #ui {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            color: white;
+            pointer-events: none;
+            z-index: 10;
+            font-family: 'Segoe UI', sans-serif;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.5);
+        }
+        #overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(15, 23, 42, 0.9);
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            color: white;
+            z-index: 20;
+            font-family: sans-serif;
+            text-align: center;
+            padding: 20px;
+        }
+        .btn {
+            background: #10b981;
+            padding: 15px 40px;
+            border-radius: 12px;
+            cursor: pointer;
+            font-weight: bold;
+            margin-top: 20px;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            transition: all 0.2s;
+            box-shadow: 0 4px 15px rgba(16, 185, 129, 0.4);
+        }
+        .btn:hover { background: #059669; transform: translateY(-2px); }
+        .key-box {
+            background: rgba(255,255,255,0.1);
+            border: 2px solid #10b981;
+            padding: 10px 20px;
+            border-radius: 8px;
+            font-size: 1.5rem;
+            min-width: 100px;
+            margin: 10px;
+            display: inline-block;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="ui">
+        <div class="text-3xl font-black italic">SCORE: <span id="score">0</span></div>
+        <div class="text-sm opacity-80 font-bold">SPEED: <span id="speed-val">0</span> km/h</div>
+        <div id="controls-hint" class="text-xs mt-2 opacity-60"></div>
+    </div>
+
+    <div id="overlay">
+        <h1 id="title" class="text-6xl font-black mb-2 italic tracking-tighter text-emerald-400">METRO RUSH</h1>
+       
+        <div id="setup-controls" class="hidden">
+            <p class="text-xl mb-4" id="setup-msg">Press a key for LEFT</p>
+            <div id="current-key" class="key-box">?</div>
+        </div>
+
+        <div id="menu-content">
+            <p id="msg" class="text-lg opacity-80 mb-6">Avoid the other cars!</p>
+            <div id="start-btn" class="btn">Set Controls & Start</div>
+            <p class="mt-4 text-sm opacity-50">Press 'P' to Pause during game</p>
+        </div>
+    </div>
+
+    <script>
+        // --- Audio System ---
+        let audioCtx;
+        let engineOsc;
+        let engineGain;
+
+        function initAudio() {
+            if (audioCtx) return;
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            engineOsc = audioCtx.createOscillator();
+            engineGain = audioCtx.createGain();
+            engineOsc.type = 'sawtooth';
+            engineOsc.frequency.setValueAtTime(50, audioCtx.currentTime);
+            engineGain.gain.setValueAtTime(0, audioCtx.currentTime);
+            engineOsc.connect(engineGain);
+            engineGain.connect(audioCtx.destination);
+            engineOsc.start();
+        }
+
+        function updateEngineSound(currentSpeed) {
+            if (!engineOsc || !gameActive || isPaused) {
+                if(engineGain) engineGain.gain.setTargetAtTime(0, audioCtx.currentTime, 0.1);
+                return;
+            };
+            const freq = 50 + (currentSpeed * 120);
+            engineOsc.frequency.setTargetAtTime(freq, audioCtx.currentTime, 0.1);
+            engineGain.gain.setTargetAtTime(0.04, audioCtx.currentTime, 0.1);
+        }
+
+        function playCrashSound() {
+            if (!audioCtx) return;
+            const noise = audioCtx.createOscillator();
+            const noiseGain = audioCtx.createGain();
+            noise.type = 'triangle';
+            noise.frequency.setValueAtTime(100, audioCtx.currentTime);
+            noise.frequency.exponentialRampToValueAtTime(10, audioCtx.currentTime + 0.4);
+            noiseGain.gain.setValueAtTime(0.2, audioCtx.currentTime);
+            noiseGain.gain.linearRampToValueAtTime(0, audioCtx.currentTime + 0.4);
+            noise.connect(noiseGain);
+            noiseGain.connect(audioCtx.destination);
+            noise.start();
+            noise.stop(audioCtx.currentTime + 0.4);
+            if (engineGain) engineGain.gain.setTargetAtTime(0, audioCtx.currentTime, 0.1);
+        }
+
+        // --- Game Config ---
+        const LANE_WIDTH = 4.5;
+        const ROAD_LENGTH = 1000;
+        const PLAYER_Z = 0;
+       
+        let scene, camera, renderer, clock;
+        let player, road, roadMarkings = [], buildings = [];
+        let enemies = [];
+        let score = 0;
+        let speed = 0.5;
+        let gameActive = false;
+        let isPaused = false;
+       
+        // Custom Controls State
+        let leftKey = 'ArrowLeft';
+        let rightKey = 'ArrowRight';
+        let isSettingControls = false;
+        let step = 0; // 0: Left, 1: Right
+
+        let keys = {};
+
+        const scoreEl = document.getElementById('score');
+        const speedEl = document.getElementById('speed-val');
+        const overlay = document.getElementById('overlay');
+        const startBtn = document.getElementById('start-btn');
+        const titleEl = document.getElementById('title');
+        const msgEl = document.getElementById('msg');
+        const setupDiv = document.getElementById('setup-controls');
+        const menuDiv = document.getElementById('menu-content');
+        const setupMsg = document.getElementById('setup-msg');
+        const currentKeyDisplay = document.getElementById('current-key');
+        const hintEl = document.getElementById('controls-hint');
+
+        function initScene() {
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x1a1a2e);
+            scene.fog = new THREE.Fog(0x1a1a2e, 20, 120);
+
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(0, 4, 10);
+            camera.lookAt(0, 1, -20);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            document.body.appendChild(renderer.domElement);
+
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.3);
+            scene.add(ambientLight);
+
+            const hemiLight = new THREE.HemisphereLight(0x4040ff, 0xff4040, 0.6);
+            scene.add(hemiLight);
+
+            const roadGeo = new THREE.PlaneGeometry(LANE_WIDTH * 3 + 4, ROAD_LENGTH);
+            const roadMat = new THREE.MeshPhongMaterial({ color: 0x222222 });
+            road = new THREE.Mesh(roadGeo, roadMat);
+            road.rotation.x = -Math.PI / 2;
+            road.position.z = -ROAD_LENGTH / 2 + 10;
+            scene.add(road);
+
+            const curbGeo = new THREE.BoxGeometry(1, 0.5, ROAD_LENGTH);
+            const curbMat = new THREE.MeshPhongMaterial({ color: 0x444444 });
+            const leftCurb = new THREE.Mesh(curbGeo, curbMat);
+            leftCurb.position.set(-LANE_WIDTH * 1.5 - 2, 0.25, -ROAD_LENGTH/2 + 10);
+            scene.add(leftCurb);
+            const rightCurb = leftCurb.clone();
+            rightCurb.position.x = -leftCurb.position.x;
+            scene.add(rightCurb);
+
+            for (let i = 0; i < 50; i++) {
+                const markGeo = new THREE.PlaneGeometry(0.3, 4);
+                const markMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+                [-LANE_WIDTH/2, LANE_WIDTH/2].forEach(xPos => {
+                    const mark = new THREE.Mesh(markGeo, markMat);
+                    mark.rotation.x = -Math.PI / 2;
+                    mark.position.set(xPos, 0.05, -i * 20);
+                    scene.add(mark);
+                    roadMarkings.push(mark);
+                });
+            }
+
+            for (let i = 0; i < 40; i++) createBuilding(i);
+
+            player = createCar(0x10b981);
+            player.position.set(0, 0.4, PLAYER_Z);
+            scene.add(player);
+        }
+
+        function createBuilding(index) {
+            const h = 10 + Math.random() * 30;
+            const w = 5 + Math.random() * 5;
+            const geo = new THREE.BoxGeometry(w, h, 8);
+            const mat = new THREE.MeshPhongMaterial({
+                color: index % 2 === 0 ? 0x2d3436 : 0x0984e3,
+                emissive: 0x111111
+            });
+            const building = new THREE.Mesh(geo, mat);
+            const side = index % 2 === 0 ? 1 : -1;
+            building.position.set(side * (LANE_WIDTH * 2 + 10 + Math.random() * 5), h/2, -index * 25);
+            scene.add(building);
+            buildings.push(building);
+        }
+
+        function createCar(color) {
+            const car = new THREE.Group();
+            const body = new THREE.Mesh(
+                new THREE.BoxGeometry(2, 0.7, 4),
+                new THREE.MeshPhongMaterial({ color: color, shininess: 100 })
+            );
+            body.position.y = 0.35;
+            car.add(body);
+
+            const cabin = new THREE.Mesh(
+                new THREE.BoxGeometry(1.6, 0.6, 2),
+                new THREE.MeshPhongMaterial({ color: 0x111111 })
+            );
+            cabin.position.y = 0.9;
+            car.add(cabin);
+
+            const wheelGeo = new THREE.CylinderGeometry(0.4, 0.4, 0.4, 16);
+            const wheelMat = new THREE.MeshPhongMaterial({ color: 0x000000 });
+            [[-1, 0, 1.2], [1, 0, 1.2], [-1, 0, -1.2], [1, 0, -1.2]].forEach(pos => {
+                const wheel = new THREE.Mesh(wheelGeo, wheelMat);
+                wheel.rotation.z = Math.PI/2;
+                wheel.position.set(...pos);
+                car.add(wheel);
+            });
+
+            const lightMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+            const leftL = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.2, 0.1), lightMat);
+            leftL.position.set(-0.6, 0.45, -2);
+            car.add(leftL);
+            const rightL = leftL.clone();
+            rightL.position.x = 0.6;
+            car.add(rightL);
+
+            return car;
+        }
+
+        function spawnEnemy() {
+            const lane = Math.floor(Math.random() * 3) - 1;
+            const colors = [0xd63031, 0xfdcb6e, 0x6c5ce7, 0xecf0f1];
+            const enemy = createCar(colors[Math.floor(Math.random() * colors.length)]);
+            enemy.position.set(lane * LANE_WIDTH, 0.4, -100);
+            scene.add(enemy);
+            enemies.push(enemy);
+        }
+
+        function handleInput() {
+            const moveSpeed = 0.18;
+            if (keys[leftKey] && player.position.x > -LANE_WIDTH) {
+                player.position.x -= moveSpeed;
+                player.rotation.z = 0.12;
+            } else if (keys[rightKey] && player.position.x < LANE_WIDTH) {
+                player.position.x += moveSpeed;
+                player.rotation.z = -0.12;
+            } else {
+                player.rotation.z *= 0.8;
+            }
+        }
+
+        function update() {
+            if (!gameActive || isPaused) return;
+
+            handleInput();
+            updateEngineSound(speed);
+
+            roadMarkings.forEach(mark => {
+                mark.position.z += speed;
+                if (mark.position.z > 20) mark.position.z -= 1000;
+            });
+
+            buildings.forEach(b => {
+                b.position.z += speed;
+                if (b.position.z > 50) b.position.z -= 1000;
+            });
+
+            for (let i = enemies.length - 1; i >= 0; i--) {
+                const enemy = enemies[i];
+                enemy.position.z += speed * 0.4;
+                if (player.position.distanceTo(enemy.position) < 2.5) gameOver();
+                if (enemy.position.z > 20) {
+                    scene.remove(enemy);
+                    enemies.splice(i, 1);
+                    score += 150;
+                    speed += 0.003;
+                    scoreEl.innerText = score;
+                }
+            }
+
+            if (Math.random() < 0.03) spawnEnemy();
+            speedEl.innerText = Math.floor(speed * 140);
+        }
+
+        function gameOver() {
+            gameActive = false;
+            playCrashSound();
+            titleEl.innerText = "CRASHED!";
+            msgEl.innerText = `Urban Score: ${score}`;
+            startBtn.innerText = "Retry Rush";
+            overlay.style.display = 'flex';
+        }
+
+        function togglePause() {
+            if(!gameActive) return;
+            isPaused = !isPaused;
+            if(isPaused) {
+                overlay.style.display = 'flex';
+                titleEl.innerText = "PAUSED";
+                msgEl.innerText = "Game is paused";
+                startBtn.innerText = "Resume Engine";
+                menuDiv.classList.remove('hidden');
+                setupDiv.classList.add('hidden');
+            } else {
+                overlay.style.display = 'none';
+            }
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            update();
+            renderer.render(scene, camera);
+        }
+
+        function startControlSetup() {
+            isSettingControls = true;
+            step = 0;
+            menuDiv.classList.add('hidden');
+            setupDiv.classList.remove('hidden');
+            setupMsg.innerText = "Press a key for LEFT";
+            currentKeyDisplay.innerText = "?";
+        }
+
+        function finishControlSetup() {
+            isSettingControls = false;
+            setupDiv.classList.add('hidden');
+            menuDiv.classList.remove('hidden');
+            hintEl.innerText = `Left: ${leftKey.replace('Arrow','')} | Right: ${rightKey.replace('Arrow','')} | P: Pause`;
+            startGame();
+        }
+
+        function startGame() {
+            initAudio();
+            if (audioCtx.state === 'suspended') audioCtx.resume();
+           
+            if (isPaused) {
+                isPaused = false;
+                overlay.style.display = 'none';
+                return;
+            }
+
+            score = 0;
+            speed = 0.7;
+            scoreEl.innerText = "0";
+            enemies.forEach(e => scene.remove(e));
+            enemies = [];
+            player.position.x = 0;
+            gameActive = true;
+            overlay.style.display = 'none';
+        }
+
+        window.addEventListener('keydown', e => {
+            if (isSettingControls) {
+                if (step === 0) {
+                    leftKey = e.code;
+                    currentKeyDisplay.innerText = leftKey.replace('Arrow','');
+                    step = 1;
+                    setTimeout(() => {
+                        setupMsg.innerText = "Press a key for RIGHT";
+                        currentKeyDisplay.innerText = "?";
+                    }, 300);
+                } else {
+                    rightKey = e.code;
+                    currentKeyDisplay.innerText = rightKey.replace('Arrow','');
+                    setTimeout(finishControlSetup, 300);
+                }
+                return;
+            }
+
+            if (e.code === 'KeyP') togglePause();
+            keys[e.code] = true;
+        });
+
+        window.addEventListener('keyup', e => keys[e.code] = false);
+
+        startBtn.addEventListener('click', () => {
+            if (isPaused) startGame();
+            else startControlSetup();
+        });
+
+        window.onload = () => {
+            initScene();
+            animate();
+        };
+    </script>
+</body>
+</html>
